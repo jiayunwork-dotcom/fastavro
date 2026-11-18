@@ -49,6 +49,14 @@ import fastavro.write
 import fastavro.schema
 import fastavro.validation
 
+from fastavro._union import (  # noqa: F401
+    UnionValue,
+    get_union_branch,
+    get_union_value,
+    is_union_value,
+    make_union_value,
+)
+
 reader = fastavro.read.reader
 json_reader = fastavro.json_read.json_reader
 block_reader = fastavro.read.block_reader

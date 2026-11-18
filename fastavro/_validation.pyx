@@ -11,6 +11,7 @@ from ._schema import (
 from ._logical_writers import LOGICAL_WRITERS
 from ._schema_common import UnknownType
 from ._validate_common import ValidationError, ValidationErrorData
+from ._union import UnionValue, resolve_marker_index
 
 ctypedef int int32
 ctypedef unsigned int uint32
@@ -168,6 +169,23 @@ cdef inline bint validate_union(
     bint raise_errors,
     dict options,
 ) except -1:
+    if isinstance(datum, UnionValue):
+        # A branch marker from `reader(return_union_branch=True)`.  Only the
+        # named branch is acceptable; a marker for a missing branch is an
+        # error even if its payload would validate against some other branch.
+        try:
+            index = resolve_marker_index(schema, datum, named_schemas)
+        except ValueError:
+            return False
+        return _validate(
+            datum.value,
+            schema=schema[index],
+            named_schemas=named_schemas,
+            field=parent_ns,
+            raise_errors=raise_errors,
+            options=options,
+        )
+
     if isinstance(datum, tuple) and not options.get("disable_tuple_notation"):
         (name, datum) = datum
         for candidate in schema:
@@ -219,78 +237,85 @@ cpdef _validate(
     record_type = extract_record_type(schema)
     result = None
 
-    logical_type = extract_logical_type(schema)
-    if logical_type:
-        prepare = LOGICAL_WRITERS.get(logical_type)
-        if prepare:
-            datum = prepare(datum, schema)
-
-    # explicit, so that cython is faster, but only for Base Validators
-    if record_type == "null":
-        result = validate_null(datum)
-    elif record_type == "boolean":
-        result = validate_boolean(datum)
-    elif record_type == "string":
-        result = validate_string(datum)
-    elif record_type == "int":
-        result = validate_int(datum)
-    elif record_type == "long":
-        result = validate_long(datum)
-    elif record_type in ("float", "double"):
-        result = validate_float(datum)
-    elif record_type == "bytes":
-        result = validate_bytes(datum)
-    elif record_type == "fixed":
-        result = validate_fixed(datum, schema=schema)
-    elif record_type == "enum":
-        result = validate_enum(datum, schema=schema)
-    elif record_type == "array":
-        result = validate_array(
-            datum,
-            schema=schema,
-            named_schemas=named_schemas,
-            parent_ns=field,
-            raise_errors=raise_errors,
-            options=options,
-        )
-    elif record_type == "map":
-        result = validate_map(
-            datum,
-            schema=schema,
-            named_schemas=named_schemas,
-            parent_ns=field,
-            raise_errors=raise_errors,
-            options=options,
-        )
-    elif record_type in ("union", "error_union"):
-        result = validate_union(
-            datum,
-            schema=schema,
-            named_schemas=named_schemas,
-            parent_ns=field,
-            raise_errors=raise_errors,
-            options=options,
-        )
-    elif record_type in ("record", "error", "request"):
-        result = validate_record(
-            datum,
-            schema=schema,
-            named_schemas=named_schemas,
-            parent_ns=field,
-            raise_errors=raise_errors,
-            options=options,
-        )
-    elif record_type in named_schemas:
-        result = _validate(
-            datum,
-            schema=named_schemas[record_type],
-            named_schemas=named_schemas,
-            field=field,
-            raise_errors=raise_errors,
-            options=options,
-        )
+    if isinstance(datum, UnionValue) and record_type not in (
+        "union",
+        "error_union",
+    ):
+        # A branch marker only makes sense where the schema still has a union.
+        result = False
     else:
-        raise UnknownType(record_type)
+        logical_type = extract_logical_type(schema)
+        if logical_type:
+            prepare = LOGICAL_WRITERS.get(logical_type)
+            if prepare:
+                datum = prepare(datum, schema)
+
+        # explicit, so that cython is faster, but only for Base Validators
+        if record_type == "null":
+            result = validate_null(datum)
+        elif record_type == "boolean":
+            result = validate_boolean(datum)
+        elif record_type == "string":
+            result = validate_string(datum)
+        elif record_type == "int":
+            result = validate_int(datum)
+        elif record_type == "long":
+            result = validate_long(datum)
+        elif record_type in ("float", "double"):
+            result = validate_float(datum)
+        elif record_type == "bytes":
+            result = validate_bytes(datum)
+        elif record_type == "fixed":
+            result = validate_fixed(datum, schema=schema)
+        elif record_type == "enum":
+            result = validate_enum(datum, schema=schema)
+        elif record_type == "array":
+            result = validate_array(
+                datum,
+                schema=schema,
+                named_schemas=named_schemas,
+                parent_ns=field,
+                raise_errors=raise_errors,
+                options=options,
+            )
+        elif record_type == "map":
+            result = validate_map(
+                datum,
+                schema=schema,
+                named_schemas=named_schemas,
+                parent_ns=field,
+                raise_errors=raise_errors,
+                options=options,
+            )
+        elif record_type in ("union", "error_union"):
+            result = validate_union(
+                datum,
+                schema=schema,
+                named_schemas=named_schemas,
+                parent_ns=field,
+                raise_errors=raise_errors,
+                options=options,
+            )
+        elif record_type in ("record", "error", "request"):
+            result = validate_record(
+                datum,
+                schema=schema,
+                named_schemas=named_schemas,
+                parent_ns=field,
+                raise_errors=raise_errors,
+                options=options,
+            )
+        elif record_type in named_schemas:
+            result = _validate(
+                datum,
+                schema=named_schemas[record_type],
+                named_schemas=named_schemas,
+                field=field,
+                raise_errors=raise_errors,
+                options=options,
+            )
+        else:
+            raise UnknownType(record_type)
 
     if raise_errors and result is False:
         raise ValidationError(ValidationErrorData(datum, schema, field))

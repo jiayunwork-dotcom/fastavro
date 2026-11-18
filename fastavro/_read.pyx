@@ -31,6 +31,12 @@ from ._read_common import (
     HEADER_SCHEMA,
     missing_codec_lib,
 )
+from ._union import (
+    _UnionReadResult,
+    check_union_branch_options,
+    finish_union_read,
+    materialize_default,
+)
 from .const import NAMED_TYPES, AVRO_TYPES
 
 CYTHON_MODULE = 1  # Tests check this to confirm whether using the Cython code.
@@ -573,6 +579,11 @@ cpdef read_union(
     else:
         result = _read_data(fo, idx_schema, named_schemas, None, options)
 
+    if options.get("return_union_branch"):
+        # `_read_data` turns this into a UnionValue (or a plain value when the
+        # reader schema collapsed the location to a single type).
+        return _UnionReadResult(index, idx_schema, idx_reader_schema, result)
+
     return_record_name_override = options.get("return_record_name_override")
     return_record_name = options.get("return_record_name")
     return_named_type_override = options.get("return_named_type_override")
@@ -686,7 +697,12 @@ cpdef read_record(
         # fill in default values
         for f_name, field in readers_field_dict.items():
             if "default" in field:
-                record[field["name"]] = field["default"]
+                default = field["default"]
+                if options.get("return_union_branch"):
+                    default = materialize_default(
+                        field["type"], default, named_schemas["reader"]
+                    )
+                record[field["name"]] = default
             else:
                 msg = f"No default value for field {field['name']} in {reader_schema['name']}"
                 raise SchemaResolutionError(msg)
@@ -724,6 +740,8 @@ cpdef _read_data(
     """Read data from file object according to schema."""
 
     record_type = extract_record_type(writer_schema)
+    branch_mode = options.get("return_union_branch")
+    original_reader_schema = reader_schema if branch_mode else None
 
     if reader_schema:
         reader_schema = match_schemas(
@@ -784,30 +802,76 @@ cpdef _read_data(
                 options,
             )
         else:
-            return _read_data(
+            if isinstance(reader_schema, str):
+                # A named reference has to be resolved against the reader's
+                # named schemas.  An already resolved schema (e.g. the branch
+                # chosen from a reader union) is used as-is.
+                resolved_reader_schema = named_schemas["reader"].get(reader_schema)
+            else:
+                resolved_reader_schema = reader_schema
+
+            data = _read_data(
                 fo,
                 named_schemas["writer"][record_type],
                 named_schemas,
-                named_schemas["reader"].get(reader_schema),
+                resolved_reader_schema,
                 options,
             )
+            if branch_mode and isinstance(original_reader_schema, list):
+                return finish_union_read(
+                    data,
+                    writer_schema,
+                    original_reader_schema,
+                    reader_schema,
+                    named_schemas,
+                )
+            return data
     except ReadError:
         raise EOFError(f"cannot read {record_type} from {fo}")
+
+    if branch_mode and isinstance(data, _UnionReadResult):
+        # Union reading already applied the branch schema and any logical type
+        # or promotion conversion.
+        return finish_union_read(
+            data,
+            writer_schema,
+            original_reader_schema,
+            reader_schema,
+            named_schemas,
+        )
 
     if "logicalType" in writer_schema:
         logical_type = extract_logical_type(writer_schema)
         fn = LOGICAL_READERS.get(logical_type)
         if fn:
-            return fn(data, writer_schema, reader_schema)
-
-    if reader_schema is not None:
-        return maybe_promote(
+            # NOTE: This matches the historical behavior: a value handled by a
+            # logical reader is returned without primitive promotion.
+            data = fn(data, writer_schema, reader_schema)
+        elif reader_schema is not None:
+            data = maybe_promote(
+                data,
+                record_type,
+                extract_record_type(reader_schema)
+            )
+    elif reader_schema is not None:
+        data = maybe_promote(
             data,
             record_type,
             extract_record_type(reader_schema)
         )
-    else:
-        return data
+
+    if branch_mode and isinstance(original_reader_schema, list):
+        # The writer location is not a union but the reader schema is; the
+        # branch selected by schema resolution is the target branch.
+        return finish_union_read(
+            data,
+            writer_schema,
+            original_reader_schema,
+            reader_schema,
+            named_schemas,
+        )
+
+    return data
 
 
 cpdef _skip_data(
@@ -1122,13 +1186,22 @@ class reader(file_reader):
         handle_unicode_errors="strict",
         return_named_type=False,
         return_named_type_override=False,
+        return_union_branch=False,
     ):
+        check_union_branch_options(
+            return_union_branch,
+            return_record_name=return_record_name,
+            return_record_name_override=return_record_name_override,
+            return_named_type=return_named_type,
+            return_named_type_override=return_named_type_override,
+        )
         options = {
             "return_record_name": return_record_name,
             "return_record_name_override": return_record_name_override,
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "return_union_branch": return_union_branch,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1151,13 +1224,22 @@ class block_reader(file_reader):
         handle_unicode_errors="strict",
         return_named_type=False,
         return_named_type_override=False,
+        return_union_branch=False,
     ):
+        check_union_branch_options(
+            return_union_branch,
+            return_record_name=return_record_name,
+            return_record_name_override=return_record_name_override,
+            return_named_type=return_named_type,
+            return_named_type_override=return_named_type_override,
+        )
         options = {
             "return_record_name": return_record_name,
             "return_record_name_override": return_record_name_override,
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "return_union_branch": return_union_branch,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1179,7 +1261,16 @@ cpdef schemaless_reader(
     handle_unicode_errors="strict",
     return_named_type=False,
     return_named_type_override=False,
+    return_union_branch=False,
 ):
+    check_union_branch_options(
+        return_union_branch,
+        return_record_name=return_record_name,
+        return_record_name_override=return_record_name_override,
+        return_named_type=return_named_type,
+        return_named_type_override=return_named_type_override,
+    )
+
     if writer_schema == reader_schema:
         # No need for the reader schema if they are the same
         reader_schema = None
@@ -1196,6 +1287,7 @@ cpdef schemaless_reader(
         "handle_unicode_errors": handle_unicode_errors,
         "return_named_type": return_named_type,
         "return_named_type_override": return_named_type_override,
+        "return_union_branch": return_union_branch,
     }
     return _read_data(
         fo,

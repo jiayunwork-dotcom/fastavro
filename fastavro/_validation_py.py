@@ -8,6 +8,7 @@ from ._validate_common import ValidationError, ValidationErrorData
 from .schema import extract_record_type, extract_logical_type, schema_name, parse_schema
 from .logical_writers import LOGICAL_WRITERS
 from ._schema_common import UnknownType
+from ._union import UnionValue, resolve_marker_index
 from .types import Schema, NamedSchemas
 
 NoValue = object()
@@ -158,6 +159,23 @@ def _validate_union(datum, schema, named_schemas, parent_ns, raise_errors, optio
     Check that the data is a list type with possible options to
     validate as True.
     """
+    if isinstance(datum, UnionValue):
+        # A branch marker from `reader(return_union_branch=True)`.  Only the
+        # named branch is acceptable; a marker for a missing branch is an
+        # error even if its payload would validate against some other branch.
+        try:
+            index = resolve_marker_index(schema, datum, named_schemas)
+        except ValueError:
+            return False
+        return _validate(
+            datum.value,
+            schema=schema[index],
+            named_schemas=named_schemas,
+            field=parent_ns,
+            raise_errors=raise_errors,
+            options=options,
+        )
+
     if isinstance(datum, tuple) and not options.get("disable_tuple_notation"):
         (name, datum) = datum
         for candidate in schema:
@@ -224,7 +242,13 @@ def _validate(datum, schema, named_schemas, field, raise_errors, options):
     record_type = extract_record_type(schema)
     result = None
 
-    if datum is NoValue and options.get("strict"):
+    if isinstance(datum, UnionValue) and record_type not in (
+        "union",
+        "error_union",
+    ):
+        # A branch marker only makes sense where the schema still has a union.
+        result = False
+    elif datum is NoValue and options.get("strict"):
         result = False
     else:
         if datum is NoValue:

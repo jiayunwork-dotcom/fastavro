@@ -23,6 +23,7 @@ from ._validation import _validate
 from ._read import HEADER_SCHEMA, SYNC_SIZE, MAGIC, reader
 from ._schema import extract_record_type, extract_logical_type, parse_schema
 from ._write_common import _is_appendable
+from ._union import UnionValue, resolve_marker_index
 
 CYTHON_MODULE = 1  # Tests check this to confirm whether using the Cython code.
 
@@ -254,7 +255,28 @@ cdef write_union(bytearray fo, datum, schema, dict named_schemas, fname, dict op
     cdef str extracted_type
     cdef str schema_name
     best_match_index = -1
-    if isinstance(datum, tuple) and not options.get("disable_tuple_notation"):
+    if isinstance(datum, UnionValue):
+        # A branch marker from `reader(return_union_branch=True)`.  The branch
+        # is authoritative and works even with `disable_tuple_notation`.
+        best_match_index = resolve_marker_index(schema, datum, named_schemas)
+        datum = datum.value
+        index = best_match_index
+        # The branch check is part of the meaning of the marker, so it runs
+        # even when the writer-level `validator` option is disabled.
+        if not _validate(
+            datum,
+            schema[index],
+            named_schemas,
+            field=fname or "",
+            raise_errors=False,
+            options=options,
+        ):
+            field = f" on field {fname}" if fname else ""
+            raise ValueError(
+                f"union branch {schema[index]!r} does not accept "
+                f"{repr(datum)}{field}"
+            )
+    elif isinstance(datum, tuple) and not options.get("disable_tuple_notation"):
         (name, datum) = datum
         for index, candidate in enumerate(schema):
             extracted_type = extract_record_type(candidate)
@@ -430,6 +452,14 @@ cpdef write_data(bytearray fo, datum, schema, dict named_schemas, fname, dict op
                 datum = prepare(datum, schema)
 
     record_type = extract_record_type(schema)
+    if isinstance(datum, UnionValue) and record_type not in (
+        "union",
+        "error_union",
+    ):
+        raise ValueError(
+            f"union branch marker {datum!r} was given for non-union schema "
+            f"{schema}"
+        )
     try:
         if record_type == "null":
             return write_null(fo, datum)

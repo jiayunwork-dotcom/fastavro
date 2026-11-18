@@ -33,6 +33,12 @@ from ._read_common import (
     HEADER_SCHEMA,
     missing_codec_lib,
 )
+from ._union import (
+    _UnionReadResult,
+    check_union_branch_options,
+    finish_union_read,
+    materialize_default,
+)
 from .const import NAMED_TYPES, AVRO_TYPES
 
 T = TypeVar("T")
@@ -448,6 +454,11 @@ def read_union(
     else:
         result = read_data(decoder, idx_schema, named_schemas, None, options)
 
+    if options.get("return_union_branch"):
+        # `read_data` turns this into a UnionValue (or a plain value when the
+        # reader schema collapsed the location to a single type).
+        return _UnionReadResult(index, idx_schema, idx_reader_schema, result)
+
     return_record_name_override = options.get("return_record_name_override")
     return_record_name = options.get("return_record_name")
     return_named_type_override = options.get("return_named_type_override")
@@ -556,7 +567,12 @@ def read_record(
         # fill in default values
         for f_name, field in readers_field_dict.items():
             if "default" in field:
-                record[field["name"]] = field["default"]
+                default = field["default"]
+                if options.get("return_union_branch"):
+                    default = materialize_default(
+                        field["type"], default, named_schemas["reader"]
+                    )
+                record[field["name"]] = default
             else:
                 msg = f"No default value for field {field['name']} in {reader_schema['name']}"
                 raise SchemaResolutionError(msg)
@@ -635,6 +651,8 @@ def read_data(
     """Read data from file object according to schema."""
 
     record_type = extract_record_type(writer_schema)
+    branch_mode = options.get("return_union_branch")
+    original_reader_schema = reader_schema if branch_mode else None
 
     if reader_schema:
         reader_schema = match_schemas(
@@ -656,24 +674,67 @@ def read_data(
         except StructError:
             raise EOFError(f"cannot read {record_type} from {decoder.fo}")
 
+        if branch_mode and isinstance(data, _UnionReadResult):
+            # Union reading already applied the branch schema and any logical
+            # type / promotion conversion.
+            return finish_union_read(
+                data,
+                writer_schema,
+                original_reader_schema,
+                reader_schema,
+                named_schemas,
+            )
+
+        handled_by_logical_reader: bool = False
         if "logicalType" in writer_schema:
             logical_type = extract_logical_type(writer_schema)
             fn = LOGICAL_READERS.get(logical_type)
             if fn:
-                return fn(data, writer_schema, reader_schema)
+                # NOTE: This matches the historical behavior: a value handled
+                # by a logical reader is returned without primitive promotion.
+                data = fn(data, writer_schema, reader_schema)
+                handled_by_logical_reader = True
 
-        if reader_schema is not None:
-            return maybe_promote(data, record_type, extract_record_type(reader_schema))
-        else:
-            return data
+        if not handled_by_logical_reader and reader_schema is not None:
+            data = maybe_promote(data, record_type, extract_record_type(reader_schema))
+
+        if branch_mode and isinstance(original_reader_schema, list):
+            # The writer location is not a union but the reader schema is; the
+            # branch selected by schema resolution is the target branch.
+            return finish_union_read(
+                data,
+                writer_schema,
+                original_reader_schema,
+                reader_schema,
+                named_schemas,
+            )
+
+        return data
     else:
-        return read_data(
+        if isinstance(reader_schema, str):
+            # A named reference has to be resolved against the reader's named
+            # schemas.  An already resolved schema (e.g. the branch chosen from
+            # a reader union) is used as-is.
+            resolved_reader_schema = named_schemas["reader"].get(reader_schema)
+        else:
+            resolved_reader_schema = reader_schema
+
+        data = read_data(
             decoder,
             named_schemas["writer"][record_type],
             named_schemas,
-            named_schemas["reader"].get(reader_schema),
+            resolved_reader_schema,
             options,
         )
+        if branch_mode and isinstance(original_reader_schema, list):
+            return finish_union_read(
+                data,
+                writer_schema,
+                original_reader_schema,
+                reader_schema,
+                named_schemas,
+            )
+        return data
 
 
 def skip_data(decoder, writer_schema, named_schemas):
@@ -1039,14 +1100,30 @@ class reader(file_reader[AvroMessage]):
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    return_union_branch
+        If true, every union value is returned as a
+        :class:`fastavro.UnionValue` with ``branch`` (the Avro type name for
+        primitive branches or the full name of named branches), ``value`` (the
+        plain value) and ``index`` (position in the union that was read).
+        When a reader schema is used, the branch is the one selected by schema
+        resolution; if the reader schema replaced the union with a plain type
+        the plain value is returned at that position instead. Defaults filled
+        in from the reader schema use the same representation.
+        NOTE: This option cannot be combined with ``return_record_name``,
+        ``return_record_name_override``, ``return_named_type`` or
+        ``return_named_type_override``. A ``ValueError`` is raised for those
+        combinations.
 
 
     Example::
 
-        from fastavro import reader
+        from fastavro import reader, UnionValue
         with open('some-file.avro', 'rb') as fo:
-            avro_reader = reader(fo)
+            avro_reader = reader(fo, return_union_branch=True)
             for record in avro_reader:
+                value = record["measurement"]
+                if isinstance(value, UnionValue):
+                    print(value.branch, value.value)
                 process_record(record)
 
     The `fo` argument is a file-like object so another common example usage
@@ -1087,13 +1164,22 @@ class reader(file_reader[AvroMessage]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        return_union_branch: bool = False,
     ):
+        check_union_branch_options(
+            return_union_branch,
+            return_record_name=return_record_name,
+            return_record_name_override=return_record_name_override,
+            return_named_type=return_named_type,
+            return_named_type_override=return_named_type_override,
+        )
         options = {
             "return_record_name": return_record_name,
             "return_record_name_override": return_record_name_override,
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "return_union_branch": return_union_branch,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1166,13 +1252,18 @@ class block_reader(file_reader[Block]):
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    return_union_branch
+        If true, every union value is returned as a
+        :class:`fastavro.UnionValue` (see :class:`reader`). Blocks keep the
+        same option, so records yielded from a block use the same
+        representation.
 
 
     Example::
 
         from fastavro import block_reader
         with open('some-file.avro', 'rb') as fo:
-            avro_reader = block_reader(fo)
+            avro_reader = block_reader(fo, return_union_branch=True)
             for block in avro_reader:
                 process_block(block)
 
@@ -1202,13 +1293,22 @@ class block_reader(file_reader[Block]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        return_union_branch: bool = False,
     ):
+        check_union_branch_options(
+            return_union_branch,
+            return_record_name=return_record_name,
+            return_record_name_override=return_record_name_override,
+            return_named_type=return_named_type,
+            return_named_type_override=return_named_type_override,
+        )
         options = {
             "return_record_name": return_record_name,
             "return_record_name_override": return_record_name_override,
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "return_union_branch": return_union_branch,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1234,6 +1334,7 @@ def schemaless_reader(
     handle_unicode_errors: str = "strict",
     return_named_type: bool = False,
     return_named_type_override: bool = False,
+    return_union_branch: bool = False,
 ) -> AvroMessage:
     """Reads a single record written using the
     :meth:`~fastavro._write_py.schemaless_writer`
@@ -1272,6 +1373,9 @@ def schemaless_reader(
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    return_union_branch
+        If true, union values are returned as :class:`fastavro.UnionValue`
+        markers (see :class:`reader`).
 
 
     Example::
@@ -1282,6 +1386,14 @@ def schemaless_reader(
 
     Note: The ``schemaless_reader`` can only read a single record.
     """
+    check_union_branch_options(
+        return_union_branch,
+        return_record_name=return_record_name,
+        return_record_name_override=return_record_name_override,
+        return_named_type=return_named_type,
+        return_named_type_override=return_named_type_override,
+    )
+
     if writer_schema == reader_schema:
         # No need for the reader schema if they are the same
         reader_schema = None
@@ -1300,6 +1412,7 @@ def schemaless_reader(
         "handle_unicode_errors": handle_unicode_errors,
         "return_named_type": return_named_type,
         "return_named_type_override": return_named_type_override,
+        "return_union_branch": return_union_branch,
     }
 
     return read_data(

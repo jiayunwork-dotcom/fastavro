@@ -1,3 +1,10 @@
+Unreleased
+* Add opt-in `return_union_branch` reading to `reader`, `block_reader` and
+  `schemaless_reader`. Union values come back as `fastavro.UnionValue`
+  (`branch`, `value`, `index`), are honored by `writer`, `schemaless_writer`
+  and `validate`, and survive edits to unrelated fields. Reader-schema
+  defaults and nested array/map/record positions are marked too.
+
 2025-10-10 version 1.12.1
 * Publish Python 3.14 Wheels (@billy-doyle)
 

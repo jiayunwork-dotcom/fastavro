@@ -22,6 +22,7 @@ from .read import HEADER_SCHEMA, SYNC_SIZE, MAGIC, reader
 from .logical_writers import LOGICAL_WRITERS
 from .schema import extract_record_type, extract_logical_type, parse_schema
 from ._write_common import _is_appendable
+from ._union import UnionValue, resolve_marker_index
 from .types import Schema, NamedSchemas
 
 
@@ -139,7 +140,28 @@ def write_union(encoder, datum, schema, named_schemas, fname, options):
     is then encoded per the indicated schema within the union."""
 
     best_match_index = -1
-    if isinstance(datum, tuple) and not options.get("disable_tuple_notation"):
+    if isinstance(datum, UnionValue):
+        # A branch marker from `reader(return_union_branch=True)`.  The branch
+        # is authoritative and works even with `disable_tuple_notation`.
+        best_match_index = resolve_marker_index(schema, datum, named_schemas)
+        datum = datum.value
+        index = best_match_index
+        # The branch check is part of the meaning of the marker, so it runs
+        # even when the writer-level `validator` option is disabled.
+        if not _validate(
+            datum,
+            schema[index],
+            named_schemas,
+            field=fname or "",
+            raise_errors=False,
+            options=options,
+        ):
+            field = f" on field {fname}" if fname else ""
+            raise ValueError(
+                f"union branch {schema[index]!r} does not accept "
+                f"{repr(datum)}{field}"
+            )
+    elif isinstance(datum, tuple) and not options.get("disable_tuple_notation"):
         (name, datum) = datum
         for index, candidate in enumerate(schema):
             extracted_type = extract_record_type(candidate)
@@ -305,6 +327,14 @@ def write_data(encoder, datum, schema, named_schemas, fname, options):
 
     record_type = extract_record_type(schema)
     logical_type = extract_logical_type(schema)
+
+    if isinstance(datum, UnionValue) and record_type not in (
+        "union",
+        "error_union",
+    ):
+        raise ValueError(
+            f"union branch marker {datum!r} was given for non-union schema {schema}"
+        )
 
     fn = WRITERS.get(record_type)
     if fn:
