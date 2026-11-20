@@ -121,3 +121,32 @@ Unlike the tuple notation which can be used with any avro type in a union, this
 `-type` hint can only be used with records. However, this can be useful if you
 want to make a single record dictionary that can be used both in and out of
 unions.
+
+Recovering from a rejected record
+---------------------------------
+
+``fastavro.write.Writer`` and the ``json_writer`` encoder both treat one
+``write()`` call as an indivisible unit. If anything while encoding a record
+raises -- an illegal enum symbol deep in a nested record, array or map, a value
+the strict validator rejects, a logical type conversion that fails, or a union
+branch marker that does not match its schema -- the exception propagates to the
+caller and none of that record's bytes are kept. Records accepted before it are
+preserved, and the same writer can then encode the next record.
+
+For the binary ``Writer`` the rejected record is truncated out of the pending
+in-memory block, so ``flush()`` (or an automatic block flush) after a failure
+never publishes it and never rewrites blocks that were already written. For the
+JSON encoder the syntax/parser state and the pending output are restored to the
+boundary that preceded the failed record, so a later record starts from a clean
+record boundary.
+
+Logical type conversions are user supplied and may have side effects. Within a
+single record encoding, a given logical value is converted at most once, even
+when union branch selection inspects it before the branch is chosen. Side
+effects of a conversion that runs and then fails are not undone; only the
+writer's buffered output and syntax state are rolled back.
+
+The batch ``writer(fo, schema, records)`` entry point still stops at the first
+rejected record and re-raises. Before doing so it flushes the records that were
+already accepted, so the file contains a valid prefix and the rejected record is
+absent.

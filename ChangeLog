@@ -1,4 +1,12 @@
 Unreleased
+* Make `Writer.write` and the JSON writer recover from a rejected record.
+  A failed record (illegal enum symbol, failed validation, logical type
+  conversion error, mismatched union branch marker, ...) no longer leaves
+  partial bytes or corrupted parser state: the exception still propagates, the
+  previously accepted records are preserved, and the next record can be
+  written with the same writer. Batch `writer`/`json_writer` flush the accepted
+  prefix before re-raising, and `schemaless_writer` no longer emits partial
+  bytes. Logical type conversions now run at most once per record encoding.
 * Add opt-in `return_union_branch` reading to `reader`, `block_reader` and
   `schemaless_reader`. Union values come back as `fastavro.UnionValue`
   (`branch`, `value`, `index`), are honored by `writer`, `schemaless_writer`

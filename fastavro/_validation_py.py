@@ -9,6 +9,7 @@ from .schema import extract_record_type, extract_logical_type, schema_name, pars
 from .logical_writers import LOGICAL_WRITERS
 from ._schema_common import UnknownType
 from ._union import UnionValue, resolve_marker_index
+from ._write_common import _prepare_logical
 from .types import Schema, NamedSchemas
 
 NoValue = object()
@@ -258,7 +259,7 @@ def _validate(datum, schema, named_schemas, field, raise_errors, options):
         if logical_type:
             prepare = LOGICAL_WRITERS.get(logical_type)
             if prepare:
-                datum = prepare(datum, schema)
+                datum = _prepare_logical(datum, schema, prepare)
 
         validator = VALIDATORS.get(record_type)
         if validator:

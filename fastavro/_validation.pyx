@@ -12,6 +12,7 @@ from ._logical_writers import LOGICAL_WRITERS
 from ._schema_common import UnknownType
 from ._validate_common import ValidationError, ValidationErrorData
 from ._union import UnionValue, resolve_marker_index
+from ._write_common import _prepare_logical
 
 ctypedef int int32
 ctypedef unsigned int uint32
@@ -248,7 +249,7 @@ cpdef _validate(
         if logical_type:
             prepare = LOGICAL_WRITERS.get(logical_type)
             if prepare:
-                datum = prepare(datum, schema)
+                datum = _prepare_logical(datum, schema, prepare)
 
         # explicit, so that cython is faster, but only for Base Validators
         if record_type == "null":

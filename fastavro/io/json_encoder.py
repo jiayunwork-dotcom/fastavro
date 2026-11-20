@@ -89,6 +89,62 @@ class AvroJSONEncoder:
         json_data = "\n".join([json.dumps(record) for record in self._records])
         self._fo.write(json_data)
 
+    def checkpoint(self):
+        """Capture the encoder state before one record is encoded.
+
+        The returned value is opaque and is only meant to be given back to
+        :meth:`rollback`.  Only encoder bookkeeping is copied, never the data
+        that has already been accepted.
+        """
+        try:
+            fo_pos = self._fo.tell()
+        except (AttributeError, OSError, ValueError):
+            fo_pos = None
+        parser = getattr(self, "_parser", None)
+        parser_stack = list(parser.stack) if parser is not None else None
+        return (
+            parser_stack,
+            self._current,
+            self._key,
+            len(self._stack),
+            len(self._records),
+            fo_pos,
+        )
+
+    def rollback(self, checkpoint):
+        """Discard a partially encoded record and resume at the last boundary.
+
+        Records that were completely encoded before the checkpoint stay in
+        place.  Anything appended to the output stream for the failed record is
+        truncated away.
+        """
+        parser_stack, current, key, stack_len, records_len, fo_pos = checkpoint
+        if parser_stack is not None:
+            self._parser.stack = list(parser_stack)
+        self._current = current
+        self._key = key
+        del self._stack[stack_len:]
+        del self._records[records_len:]
+        if fo_pos is not None:
+            try:
+                self._fo.seek(fo_pos)
+                self._fo.truncate(fo_pos)
+            except (AttributeError, OSError, ValueError):
+                pass
+
+    def seal_record(self):
+        """Finish the record once all of its data has been encoded.
+
+        Draining the parser releases the completed record into ``_records``
+        immediately, so a later failure can no longer merge it with the next
+        record.  It is a no-op for an encoder that is not configured with a
+        parser (for example a custom encoder that only implements primitives).
+        """
+        parser = getattr(self, "_parser", None)
+        if parser is None:
+            return
+        parser.drain_actions()
+
     def configure(self, schema, named_schemas):
         self._parser = Parser(schema, named_schemas, self.do_action)
 

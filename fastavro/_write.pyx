@@ -22,7 +22,13 @@ from ._logical_writers import LOGICAL_WRITERS
 from ._validation import _validate
 from ._read import HEADER_SCHEMA, SYNC_SIZE, MAGIC, reader
 from ._schema import extract_record_type, extract_logical_type, parse_schema
-from ._write_common import _is_appendable
+from ._write_common import (
+    _is_appendable,
+    _begin_write_attempt,
+    _end_write_attempt,
+    _prepare_logical,
+    _write_data_with_rollback,
+)
 from ._union import UnionValue, resolve_marker_index
 
 CYTHON_MODULE = 1  # Tests check this to confirm whether using the Cython code.
@@ -341,7 +347,7 @@ cdef write_union(bytearray fo, datum, schema, dict named_schemas, fname, dict op
                     if logical_type:
                         prepare = LOGICAL_WRITERS.get(logical_type)
                         if prepare:
-                            datum = prepare(datum, candidate)
+                            datum = _prepare_logical(datum, candidate, prepare)
 
                     candidate_fields = set(
                         f["name"] for f in candidate["fields"]
@@ -449,7 +455,7 @@ cpdef write_data(bytearray fo, datum, schema, dict named_schemas, fname, dict op
         if logical_type:
             prepare = LOGICAL_WRITERS.get(logical_type)
             if prepare:
-                datum = prepare(datum, schema)
+                datum = _prepare_logical(datum, schema, prepare)
 
     record_type = extract_record_type(schema)
     if isinstance(datum, UnionValue) and record_type not in (
@@ -763,12 +769,41 @@ cdef class Writer:
         self.block_count = 0
 
     def write(self, record):
-        if self.validate_fn:
-            self.validate_fn(record, self.schema, self._named_schemas, "", True, self.options)
-        write_data(self.io.value, record, self.schema, self._named_schemas, "", self.options)
-        self.block_count += 1
-        if self.io.tell() >= self.sync_interval:
-            self.dump()
+        """Encode one record into the pending in-memory block.
+
+        Validation and encoding form a single acceptance boundary: if either
+        raises, none of the record's bytes are kept and the pending block is
+        left exactly as it was.  ``flush()`` only publishes records that were
+        fully accepted, so a failed record is never written to the underlying
+        file.
+        """
+        # Plain Python locals (not ``cdef``) so the nested rollback closure can
+        # capture them on every supported Cython version; this path is not hot.
+        block_before = self.io.tell()
+        count_before = self.block_count
+
+        def write_once():
+            if self.validate_fn:
+                self.validate_fn(record, self.schema, self._named_schemas, "", True, self.options)
+            write_data(self.io.value, record, self.schema, self._named_schemas, "", self.options)
+            self.block_count += 1
+            if self.io.tell() >= self.sync_interval:
+                self.dump()
+
+        def rollback():
+            if self.io.tell() >= block_before:
+                # dump() is only reached after write_data() returned
+                # successfully, so a failure leaves the partial record in the
+                # in-memory block.  Truncating it never touches the file.
+                del self.io.value[block_before:]
+                self.block_count = count_before
+            else:
+                # A dump emptied the block; the records it published stay
+                # published and must not be counted twice.
+                self.io.clear()
+                self.block_count = 0
+
+        _write_data_with_rollback(write_once, rollback)
 
     def write_block(self, block):
         # Clear existing block if there are any records pending
@@ -822,8 +857,17 @@ def writer(
         }
     )
 
-    for record in records:
-        output.write(record)
+    try:
+        for record in records:
+            output.write(record)
+    except BaseException:
+        # Publish what was fully accepted before the failure, then re-raise.
+        # The rejected record itself was rolled back in ``output.write``.
+        try:
+            output.flush()
+        except BaseException:
+            pass
+        raise
     output.flush()
 
 
@@ -838,16 +882,23 @@ def schemaless_writer(
     cdef bytearray tmp = bytearray()
     named_schemas = {}
     schema = parse_schema(schema, named_schemas)
-    write_data(
-        tmp,
-        record,
-        schema,
-        named_schemas,
-        "",
-        {
-            "strict": strict,
-            "strict_allow_default": strict_allow_default,
-            "disable_tuple_notation": disable_tuple_notation,
-        },
-    )
+    # Encoding into ``tmp`` first keeps the caller's stream untouched if the
+    # record fails halfway.  The same logical type value is converted only
+    # once per encoding.
+    _begin_write_attempt()
+    try:
+        write_data(
+            tmp,
+            record,
+            schema,
+            named_schemas,
+            "",
+            {
+                "strict": strict,
+                "strict_allow_default": strict_allow_default,
+                "disable_tuple_notation": disable_tuple_notation,
+            },
+        )
+    finally:
+        _end_write_attempt()
     fo.write(tmp)

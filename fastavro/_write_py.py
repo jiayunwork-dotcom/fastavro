@@ -21,7 +21,13 @@ from .validation import _validate
 from .read import HEADER_SCHEMA, SYNC_SIZE, MAGIC, reader
 from .logical_writers import LOGICAL_WRITERS
 from .schema import extract_record_type, extract_logical_type, parse_schema
-from ._write_common import _is_appendable
+from ._write_common import (
+    _is_appendable,
+    _begin_write_attempt,
+    _end_write_attempt,
+    _prepare_logical,
+    _write_data_with_rollback,
+)
 from ._union import UnionValue, resolve_marker_index
 from .types import Schema, NamedSchemas
 
@@ -225,7 +231,7 @@ def write_union(encoder, datum, schema, named_schemas, fname, options):
                     if logical_type:
                         prepare = LOGICAL_WRITERS.get(logical_type)
                         if prepare:
-                            datum = prepare(datum, candidate)
+                            datum = _prepare_logical(datum, candidate, prepare)
 
                     candidate_fields = set(f["name"] for f in candidate["fields"])
                     datum_fields = set(datum)
@@ -341,7 +347,7 @@ def write_data(encoder, datum, schema, named_schemas, fname, options):
         if logical_type:
             prepare = LOGICAL_WRITERS.get(logical_type)
             if prepare:
-                datum = prepare(datum, schema)
+                datum = _prepare_logical(datum, schema, prepare)
         try:
             return fn(encoder, datum, schema, named_schemas, fname, options)
         except TypeError as ex:
@@ -584,14 +590,45 @@ class Writer(GenericWriter):
         self.block_count = 0
 
     def write(self, record):
-        if self.validate_fn:
-            self.validate_fn(
-                record, self.schema, self._named_schemas, "", True, self.options
+        """Encode one record into the pending in-memory block.
+
+        Validation and encoding form a single acceptance boundary: if either
+        raises, none of the record's bytes are kept and the pending block is
+        left exactly as it was.  ``flush()`` only publishes records that were
+        fully accepted, so a failed record is never written to the underlying
+        file.
+        """
+        block_before = self.io._fo.tell()
+        count_before = self.block_count
+
+        def write_once():
+            if self.validate_fn:
+                self.validate_fn(
+                    record, self.schema, self._named_schemas, "", True, self.options
+                )
+            write_data(
+                self.io, record, self.schema, self._named_schemas, "", self.options
             )
-        write_data(self.io, record, self.schema, self._named_schemas, "", self.options)
-        self.block_count += 1
-        if self.io._fo.tell() >= self.sync_interval:
-            self.dump()
+            self.block_count += 1
+            if self.io._fo.tell() >= self.sync_interval:
+                self.dump()
+
+        def rollback():
+            if self.io._fo.tell() >= block_before:
+                # dump() is only reached after write_data() returned
+                # successfully, so a failure leaves the partial record in the
+                # in-memory block.  Truncating it never touches the file.
+                self.io._fo.seek(block_before, SEEK_SET)
+                self.io._fo.truncate(block_before)
+                self.block_count = count_before
+            else:
+                # A dump emptied the block; the records it published stay
+                # published and must not be counted twice.
+                self.io._fo.seek(0, SEEK_SET)
+                self.io._fo.truncate(0)
+                self.block_count = 0
+
+        _write_data_with_rollback(write_once, rollback)
 
     def write_block(self, block):
         # Clear existing block if there are any records pending
@@ -626,13 +663,29 @@ class JSONWriter(GenericWriter):
         self.encoder.configure(self.schema, self._named_schemas)
 
     def write(self, record):
-        if self.validate_fn:
-            self.validate_fn(
-                record, self.schema, self._named_schemas, "", True, self.options
+        """Encode one record as a newline separated JSON object.
+
+        Validation, encoding and the parser bookkeeping form one acceptance
+        boundary.  If any of them raises, the encoder is restored to the state
+        it had before the record, so the next ``write()`` starts at the next
+        record boundary instead of in the middle of the failed one.
+        """
+        checkpoint = self.encoder.checkpoint()
+
+        def write_once():
+            if self.validate_fn:
+                self.validate_fn(
+                    record, self.schema, self._named_schemas, "", True, self.options
+                )
+            write_data(
+                self.encoder, record, self.schema, self._named_schemas, "", self.options
             )
-        write_data(
-            self.encoder, record, self.schema, self._named_schemas, "", self.options
-        )
+            self.encoder.seal_record()
+
+        def rollback():
+            self.encoder.rollback(checkpoint)
+
+        _write_data_with_rollback(write_once, rollback)
 
     def flush(self):
         self.encoder.flush()
@@ -782,8 +835,17 @@ def writer(
             },
         )
 
-    for record in records:
-        output.write(record)
+    try:
+        for record in records:
+            output.write(record)
+    except BaseException:
+        # Publish what was fully accepted before the failure, then re-raise.
+        # The rejected record itself was rolled back in ``output.write``.
+        try:
+            output.flush()
+        except BaseException:
+            pass
+        raise
     output.flush()
 
 
@@ -829,17 +891,26 @@ def schemaless_writer(
     named_schemas: NamedSchemas = {}
     schema = parse_schema(schema, named_schemas)
 
-    encoder = BinaryEncoder(fo)
-    write_data(
-        encoder,
-        record,
-        schema,
-        named_schemas,
-        "",
-        {
-            "strict": strict,
-            "strict_allow_default": strict_allow_default,
-            "disable_tuple_notation": disable_tuple_notation,
-        },
-    )
+    # Encode into a temporary buffer first: a record that fails halfway must
+    # not leave a partial value on the caller's stream.  The same logical type
+    # value is converted only once per encoding.
+    buffer = BytesIO()
+    encoder = BinaryEncoder(buffer)
+    _begin_write_attempt()
+    try:
+        write_data(
+            encoder,
+            record,
+            schema,
+            named_schemas,
+            "",
+            {
+                "strict": strict,
+                "strict_allow_default": strict_allow_default,
+                "disable_tuple_notation": disable_tuple_notation,
+            },
+        )
+    finally:
+        _end_write_attempt()
     encoder.flush()
+    fo.write(buffer.getvalue())
