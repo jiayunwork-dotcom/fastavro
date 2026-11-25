@@ -20,6 +20,7 @@ from ._schema_common import (
     RESERVED_PROPERTIES,
     OPTIONAL_FIELD_PROPERTIES,
     RESERVED_FIELD_PROPERTIES,
+    FastavroField,
     JAVA_FINGERPRINT_MAPPING,
     FINGERPRINT_ALGORITHMS,
     RABIN_64,
@@ -579,11 +580,13 @@ def _parse_schema(
 
 
 def parse_field(field, namespace, expand, names, named_schemas, ignore_default_error):
-    parsed_field = {
-        key: value
-        for key, value in field.items()
-        if key not in RESERVED_FIELD_PROPERTIES
-    }
+    parsed_field = FastavroField(
+        {
+            key: value
+            for key, value in field.items()
+            if key not in RESERVED_FIELD_PROPERTIES
+        }
+    )
 
     for prop in OPTIONAL_FIELD_PROPERTIES:
         if prop in field:

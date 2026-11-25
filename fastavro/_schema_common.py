@@ -30,7 +30,24 @@ OPTIONAL_FIELD_PROPERTIES = {
     "default",
 }
 
-RESERVED_FIELD_PROPERTIES = {"type", "name"} | OPTIONAL_FIELD_PROPERTIES
+INTERNAL_FIELD_PROPERTIES = {
+    "__fastavro_default_cache__",
+}
+
+RESERVED_FIELD_PROPERTIES = (
+    {"type", "name"} | OPTIONAL_FIELD_PROPERTIES | INTERNAL_FIELD_PROPERTIES
+)
+
+
+class FastavroField(dict):
+    """Parsed field dict with storage for a private default cache.
+
+    Being a dict subclass means equality and JSON/schema behavior remain
+    key-based; the slot is not visible as a schema property.
+    """
+
+    __slots__ = ("default_cache",)
+
 
 RABIN_64 = "CRC-64-AVRO"
 JAVA_FINGERPRINT_MAPPING = {"SHA-256": "sha256", "MD5": "md5"}

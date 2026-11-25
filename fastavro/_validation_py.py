@@ -8,9 +8,29 @@ from ._validate_common import ValidationError, ValidationErrorData
 from .schema import extract_record_type, extract_logical_type, schema_name, parse_schema
 from .logical_writers import LOGICAL_WRITERS
 from ._schema_common import UnknownType
+from ._default_utils import PreparedDefault, get_writer_default
 from .types import Schema, NamedSchemas
 
 NoValue = object()
+
+
+class _InvalidDefault:
+    __slots__ = ("error",)
+
+    def __init__(self, error: Exception):
+        self.error = error
+
+
+def _record_field_value(datum, field, named_schemas):
+    value = datum.get(field["name"], NoValue)
+    if value is not NoValue:
+        return value
+    if "default" not in field:
+        return NoValue
+    try:
+        return get_writer_default(field, named_schemas)
+    except Exception as error:
+        return _InvalidDefault(error)
 
 
 def _validate_null(datum, **kwargs):
@@ -136,12 +156,13 @@ def _validate_record(datum, schema, named_schemas, parent_ns, raise_errors, opti
     validated as True.
     """
     _, fullname = schema_name(schema, parent_ns)
+
     return (
         isinstance(datum, Mapping)
         and not ("-type" in datum and datum["-type"] != fullname)
         and all(
             _validate(
-                datum=datum.get(f["name"], f.get("default", NoValue)),
+                datum=_record_field_value(datum, f, named_schemas),
                 schema=f["type"],
                 named_schemas=named_schemas,
                 field=f"{fullname}.{f['name']}",
@@ -224,14 +245,24 @@ def _validate(datum, schema, named_schemas, field, raise_errors, options):
     record_type = extract_record_type(schema)
     result = None
 
+    if isinstance(datum, _InvalidDefault):
+        if raise_errors:
+            error_data = ValidationErrorData(None, schema, field)
+            raise ValidationError(error_data) from datum.error
+        return False
+
     if datum is NoValue and options.get("strict"):
         result = False
     else:
         if datum is NoValue:
             datum = None
 
+        prepared_default = isinstance(datum, PreparedDefault)
+        if prepared_default:
+            datum = datum.value
+
         logical_type = extract_logical_type(schema)
-        if logical_type:
+        if logical_type and not prepared_default:
             prepare = LOGICAL_WRITERS.get(logical_type)
             if prepare:
                 datum = prepare(datum, schema)

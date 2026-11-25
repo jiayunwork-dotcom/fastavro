@@ -34,6 +34,7 @@ from ._read_common import (
     missing_codec_lib,
 )
 from .const import NAMED_TYPES, AVRO_TYPES
+from ._default_utils import get_logical_default, copy_default_value
 
 T = TypeVar("T")
 
@@ -556,7 +557,11 @@ def read_record(
         # fill in default values
         for f_name, field in readers_field_dict.items():
             if "default" in field:
-                record[field["name"]] = field["default"]
+                # Defaults are cached in their logical Python form, but mutable
+                # containers must not be shared between records.
+                record[field["name"]] = copy_default_value(
+                    get_logical_default(field, named_schemas)
+                )
             else:
                 msg = f"No default value for field {field['name']} in {reader_schema['name']}"
                 raise SchemaResolutionError(msg)

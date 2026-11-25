@@ -22,6 +22,11 @@ from .read import HEADER_SCHEMA, SYNC_SIZE, MAGIC, reader
 from .logical_writers import LOGICAL_WRITERS
 from .schema import extract_record_type, extract_logical_type, parse_schema
 from ._write_common import _is_appendable
+from ._default_utils import (
+    DEFAULT_CACHE_KEY,
+    PreparedDefault,
+    get_writer_default,
+)
 from .types import Schema, NamedSchemas
 
 
@@ -254,7 +259,16 @@ def write_record(encoder, datum, schema, named_schemas, fname, options):
                 )
             elif "default" not in field and "null" not in field_type:
                 raise ValueError(f"no value and no default for {name}")
-        datum_value = datum.get(name, field.get("default"))
+
+            if "default" in field:
+                # Prepare the default once.  The marker inside the cached value
+                # tells write_data not to run LOGICAL_WRITERS per record.
+                datum_value = get_writer_default(field, named_schemas)
+            else:
+                datum_value = None
+        else:
+            datum_value = datum[name]
+
         if field_type == "float" or field_type == "double":
             # Handle float values like "NaN"
             datum_value = float(datum_value)
@@ -306,9 +320,13 @@ def write_data(encoder, datum, schema, named_schemas, fname, options):
     record_type = extract_record_type(schema)
     logical_type = extract_logical_type(schema)
 
+    prepared_default = isinstance(datum, PreparedDefault)
+    if prepared_default:
+        datum = datum.value
+
     fn = WRITERS.get(record_type)
     if fn:
-        if logical_type:
+        if logical_type and not prepared_default:
             prepare = LOGICAL_WRITERS.get(logical_type)
             if prepare:
                 datum = prepare(datum, schema)
@@ -445,6 +463,19 @@ else:
     BLOCK_WRITERS["lz4"] = lz4_write_block
 
 
+def _remove_default_cache_keys(schema):
+    """Remove memoized defaults before encoding a schema as Avro metadata."""
+    if isinstance(schema, dict):
+        return {
+            key: _remove_default_cache_keys(value)
+            for key, value in schema.items()
+            if key != DEFAULT_CACHE_KEY
+        }
+    if isinstance(schema, list):
+        return [_remove_default_cache_keys(value) for value in schema]
+    return schema
+
+
 class GenericWriter(ABC):
     def __init__(self, schema, metadata=None, validator=None, options={}):
         self._named_schemas = {}
@@ -482,6 +513,7 @@ class GenericWriter(ABC):
                     schemas.append(s)
             schema = schemas
 
+        schema = _remove_default_cache_keys(schema)
         self.metadata["avro.schema"] = json.dumps(schema)
 
     @abstractmethod
